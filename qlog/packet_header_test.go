@@ -8,6 +8,7 @@ import (
 
 	"github.com/lucas-clemente/quic-go/internal/protocol"
 	"github.com/lucas-clemente/quic-go/internal/wire"
+	"github.com/lucas-clemente/quic-go/logging"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -15,59 +16,10 @@ import (
 
 var _ = Describe("Packet Header", func() {
 	It("determines the packet type from the encryption level", func() {
-		Expect(getPacketTypeFromEncryptionLevel(protocol.EncryptionInitial)).To(Equal(PacketTypeInitial))
-		Expect(getPacketTypeFromEncryptionLevel(protocol.EncryptionHandshake)).To(Equal(PacketTypeHandshake))
-		Expect(getPacketTypeFromEncryptionLevel(protocol.Encryption0RTT)).To(Equal(PacketType0RTT))
-		Expect(getPacketTypeFromEncryptionLevel(protocol.Encryption1RTT)).To(Equal(PacketType1RTT))
-	})
-
-	Context("determining the packet type from the header", func() {
-		It("recognizes Initial packets", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{
-				IsLongHeader: true,
-				Type:         protocol.PacketTypeInitial,
-				Version:      protocol.VersionTLS,
-			})).To(Equal(PacketTypeInitial))
-		})
-
-		It("recognizes Handshake packets", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{
-				IsLongHeader: true,
-				Type:         protocol.PacketTypeHandshake,
-				Version:      protocol.VersionTLS,
-			})).To(Equal(PacketTypeHandshake))
-		})
-
-		It("recognizes Retry packets", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{
-				IsLongHeader: true,
-				Type:         protocol.PacketTypeRetry,
-				Version:      protocol.VersionTLS,
-			})).To(Equal(PacketTypeRetry))
-		})
-
-		It("recognizes 0-RTT packets", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{
-				IsLongHeader: true,
-				Type:         protocol.PacketType0RTT,
-				Version:      protocol.VersionTLS,
-			})).To(Equal(PacketType0RTT))
-		})
-
-		It("recognizes Version Negotiation packets", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{IsLongHeader: true})).To(Equal(PacketTypeVersionNegotiation))
-		})
-
-		It("recognizes 1-RTT packets", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{})).To(Equal(PacketType1RTT))
-		})
-
-		It("handles unrecognized packet types", func() {
-			Expect(PacketTypeFromHeader(&wire.Header{
-				IsLongHeader: true,
-				Version:      protocol.VersionTLS,
-			})).To(Equal(PacketTypeNotDetermined))
-		})
+		Expect(getPacketTypeFromEncryptionLevel(protocol.EncryptionInitial)).To(BeEquivalentTo(logging.PacketTypeInitial))
+		Expect(getPacketTypeFromEncryptionLevel(protocol.EncryptionHandshake)).To(BeEquivalentTo(logging.PacketTypeHandshake))
+		Expect(getPacketTypeFromEncryptionLevel(protocol.Encryption0RTT)).To(BeEquivalentTo(logging.PacketType0RTT))
+		Expect(getPacketTypeFromEncryptionLevel(protocol.Encryption1RTT)).To(BeEquivalentTo(logging.PacketType1RTT))
 	})
 
 	Context("marshalling", func() {
@@ -80,11 +32,17 @@ var _ = Describe("Packet Header", func() {
 			checkEncoding(data, expected)
 		}
 
-		It("marshals a header", func() {
+		It("marshals a header for a 1-RTT packet", func() {
 			check(
-				&wire.ExtendedHeader{PacketNumber: 42},
+				&wire.ExtendedHeader{
+					PacketNumber: 42,
+					KeyPhase:     protocol.KeyPhaseZero,
+				},
 				map[string]interface{}{
+					"packet_type":   "1RTT",
 					"packet_number": 42,
+					"dcil":          0,
+					"key_phase_bit": "0",
 				},
 			)
 		})
@@ -93,11 +51,86 @@ var _ = Describe("Packet Header", func() {
 			check(
 				&wire.ExtendedHeader{
 					PacketNumber: 42,
-					Header:       wire.Header{Length: 123},
+					Header: wire.Header{
+						IsLongHeader: true,
+						Type:         protocol.PacketTypeInitial,
+						Length:       123,
+						Version:      protocol.VersionNumber(0xdecafbad),
+					},
 				},
 				map[string]interface{}{
+					"packet_type":    "initial",
 					"packet_number":  42,
 					"payload_length": 123,
+					"dcil":           0,
+					"scil":           0,
+					"version":        "decafbad",
+				},
+			)
+		})
+
+		It("marshals an Initial with a token", func() {
+			check(
+				&wire.ExtendedHeader{
+					PacketNumber: 4242,
+					Header: wire.Header{
+						IsLongHeader: true,
+						Type:         protocol.PacketTypeInitial,
+						Length:       123,
+						Version:      protocol.VersionNumber(0xdecafbad),
+						Token:        []byte{0xde, 0xad, 0xbe, 0xef},
+					},
+				},
+				map[string]interface{}{
+					"packet_type":    "initial",
+					"packet_number":  4242,
+					"payload_length": 123,
+					"dcil":           0,
+					"scil":           0,
+					"version":        "decafbad",
+					"token":          map[string]interface{}{"data": "deadbeef"},
+				},
+			)
+		})
+
+		It("marshals a Retry packet", func() {
+			check(
+				&wire.ExtendedHeader{
+					Header: wire.Header{
+						IsLongHeader:    true,
+						Type:            protocol.PacketTypeRetry,
+						SrcConnectionID: protocol.ConnectionID{0x11, 0x22, 0x33, 0x44},
+						Version:         protocol.VersionNumber(0xdecafbad),
+						Token:           []byte{0xde, 0xad, 0xbe, 0xef},
+					},
+				},
+				map[string]interface{}{
+					"packet_type": "retry",
+					"dcil":        0,
+					"scil":        4,
+					"scid":        "11223344",
+					"token":       map[string]interface{}{"data": "deadbeef"},
+					"version":     "decafbad",
+				},
+			)
+		})
+
+		It("marshals a packet with packet number 0", func() {
+			check(
+				&wire.ExtendedHeader{
+					PacketNumber: 0,
+					Header: wire.Header{
+						IsLongHeader: true,
+						Type:         protocol.PacketTypeHandshake,
+						Version:      protocol.VersionNumber(0xdecafbad),
+					},
+				},
+				map[string]interface{}{
+					"packet_type":   "handshake",
+					"packet_number": 0,
+					"dcil":          0,
+					"scil":          0,
+					"version":       "decafbad",
 				},
 			)
 		})
@@ -107,40 +140,36 @@ var _ = Describe("Packet Header", func() {
 				&wire.ExtendedHeader{
 					PacketNumber: 42,
 					Header: wire.Header{
+						IsLongHeader:    true,
+						Type:            protocol.PacketTypeHandshake,
 						SrcConnectionID: protocol.ConnectionID{0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+						Version:         protocol.VersionNumber(0xdecafbad),
 					},
 				},
 				map[string]interface{}{
+					"packet_type":   "handshake",
 					"packet_number": 42,
+					"dcil":          0,
 					"scil":          16,
 					"scid":          "00112233445566778899aabbccddeeff",
+					"version":       "decafbad",
 				},
 			)
 		})
 
-		It("marshals a header with a destination connection ID", func() {
+		It("marshals a 1-RTT header with a destination connection ID", func() {
 			check(
 				&wire.ExtendedHeader{
 					PacketNumber: 42,
 					Header:       wire.Header{DestConnectionID: protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef}},
+					KeyPhase:     protocol.KeyPhaseOne,
 				},
 				map[string]interface{}{
+					"packet_type":   "1RTT",
 					"packet_number": 42,
 					"dcil":          4,
 					"dcid":          "deadbeef",
-				},
-			)
-		})
-
-		It("marshals a header with a version number", func() {
-			check(
-				&wire.ExtendedHeader{
-					PacketNumber: 42,
-					Header:       wire.Header{Version: protocol.VersionNumber(0xdecafbad)},
-				},
-				map[string]interface{}{
-					"packet_number": 42,
-					"version":       "decafbad",
+					"key_phase_bit": "1",
 				},
 			)
 		})

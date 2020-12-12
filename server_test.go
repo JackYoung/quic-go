@@ -14,17 +14,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-
-	"github.com/lucas-clemente/quic-go/qlog"
-
-	"github.com/golang/mock/gomock"
 	"github.com/lucas-clemente/quic-go/internal/handshake"
+	mocklogging "github.com/lucas-clemente/quic-go/internal/mocks/logging"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/lucas-clemente/quic-go/internal/qerr"
 	"github.com/lucas-clemente/quic-go/internal/testdata"
 	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/internal/wire"
-	"github.com/lucas-clemente/quic-go/quictrace"
+	"github.com/lucas-clemente/quic-go/logging"
+
+	"github.com/golang/mock/gomock"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -38,7 +37,7 @@ func areServersRunning() bool {
 
 var _ = Describe("Server", func() {
 	var (
-		conn    *mockPacketConn
+		conn    *MockPacketConn
 		tlsConf *tls.Config
 	)
 
@@ -61,8 +60,9 @@ var _ = Describe("Server", func() {
 		data = data[:len(data)+16]
 		sealer.EncryptHeader(data[n:n+16], &data[0], data[n-4:n])
 		return &receivedPacket{
-			data:   data,
-			buffer: buffer,
+			remoteAddr: &net.UDPAddr{IP: net.IPv4(4, 5, 6, 7), Port: 456},
+			data:       data,
+			buffer:     buffer,
 		}
 	}
 
@@ -96,8 +96,9 @@ var _ = Describe("Server", func() {
 	}
 
 	BeforeEach(func() {
-		conn = newMockPacketConn()
-		conn.addr = &net.UDPAddr{}
+		conn = NewMockPacketConn(mockCtrl)
+		conn.EXPECT().LocalAddr().Return(&net.UDPAddr{}).AnyTimes()
+		conn.EXPECT().ReadFrom(gomock.Any()).Do(func(_ []byte) { <-(make(chan struct{})) }).MaxTimes(1)
 		tlsConf = testdata.GetTLSConfig()
 		tlsConf.NextProtos = []string{"proto1"}
 	})
@@ -134,7 +135,6 @@ var _ = Describe("Server", func() {
 	It("setups with the right values", func() {
 		supportedVersions := []protocol.VersionNumber{protocol.VersionTLS}
 		acceptToken := func(_ net.Addr, _ *Token) bool { return true }
-		tracer := quictrace.NewTracer()
 		config := Config{
 			Versions:          supportedVersions,
 			AcceptToken:       acceptToken,
@@ -142,7 +142,6 @@ var _ = Describe("Server", func() {
 			MaxIdleTimeout:    42 * time.Minute,
 			KeepAlive:         true,
 			StatelessResetKey: []byte("foobar"),
-			QuicTracer:        tracer,
 		}
 		ln, err := Listen(conn, tlsConf, &config)
 		Expect(err).ToNot(HaveOccurred())
@@ -154,7 +153,6 @@ var _ = Describe("Server", func() {
 		Expect(reflect.ValueOf(server.config.AcceptToken)).To(Equal(reflect.ValueOf(acceptToken)))
 		Expect(server.config.KeepAlive).To(BeTrue())
 		Expect(server.config.StatelessResetKey).To(Equal([]byte("foobar")))
-		Expect(server.config.QuicTracer).To(Equal(tracer))
 		// stop the listener
 		Expect(ln.Close()).To(Succeed())
 	})
@@ -182,12 +180,14 @@ var _ = Describe("Server", func() {
 
 	Context("server accepting sessions that completed the handshake", func() {
 		var (
-			serv *baseServer
-			phm  *MockPacketHandlerManager
+			serv   *baseServer
+			phm    *MockPacketHandlerManager
+			tracer *mocklogging.MockTracer
 		)
 
 		BeforeEach(func() {
-			ln, err := Listen(conn, tlsConf, nil)
+			tracer = mocklogging.NewMockTracer(mockCtrl)
+			ln, err := Listen(conn, tlsConf, &Config{Tracer: tracer})
 			Expect(err).ToNot(HaveOccurred())
 			serv = ln.(*baseServer)
 			phm = NewMockPacketHandlerManager(mockCtrl)
@@ -201,45 +201,42 @@ var _ = Describe("Server", func() {
 
 		Context("handling packets", func() {
 			It("drops Initial packets with a too short connection ID", func() {
-				serv.handlePacket(getPacket(&wire.Header{
+				p := getPacket(&wire.Header{
 					IsLongHeader:     true,
 					Type:             protocol.PacketTypeInitial,
 					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4},
 					Version:          serv.config.Versions[0],
-				}, nil))
-				Consistently(conn.dataWritten).ShouldNot(Receive())
+				}, nil)
+				tracer.EXPECT().DroppedPacket(p.remoteAddr, logging.PacketTypeInitial, p.Size(), logging.PacketDropUnexpectedPacket)
+				serv.handlePacket(p)
+				// make sure there are no Write calls on the packet conn
+				time.Sleep(50 * time.Millisecond)
 			})
 
 			It("drops too small Initial", func() {
-				serv.handlePacket(getPacket(&wire.Header{
+				p := getPacket(&wire.Header{
 					IsLongHeader:     true,
 					Type:             protocol.PacketTypeInitial,
 					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
 					Version:          serv.config.Versions[0],
 				}, make([]byte, protocol.MinInitialPacketSize-100),
-				))
-				Consistently(conn.dataWritten).ShouldNot(Receive())
-			})
-
-			It("drops packets with a too short connection ID", func() {
-				serv.handlePacket(getPacket(&wire.Header{
-					IsLongHeader:     true,
-					Type:             protocol.PacketTypeInitial,
-					SrcConnectionID:  protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
-					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4},
-					Version:          serv.config.Versions[0],
-				}, make([]byte, protocol.MinInitialPacketSize)))
-				Consistently(conn.dataWritten).ShouldNot(Receive())
+				)
+				tracer.EXPECT().DroppedPacket(p.remoteAddr, logging.PacketTypeInitial, p.Size(), logging.PacketDropUnexpectedPacket)
+				serv.handlePacket(p)
+				// make sure there are no Write calls on the packet conn
+				time.Sleep(50 * time.Millisecond)
 			})
 
 			It("drops non-Initial packets", func() {
-				serv.handlePacket(getPacket(
-					&wire.Header{
-						Type:    protocol.PacketTypeHandshake,
-						Version: serv.config.Versions[0],
-					},
-					[]byte("invalid"),
-				))
+				p := getPacket(&wire.Header{
+					IsLongHeader: true,
+					Type:         protocol.PacketTypeHandshake,
+					Version:      serv.config.Versions[0],
+				}, []byte("invalid"))
+				tracer.EXPECT().DroppedPacket(p.remoteAddr, logging.PacketTypeHandshake, p.Size(), logging.PacketDropUnexpectedPacket)
+				serv.handlePacket(p)
+				// make sure there are no Write calls on the packet conn
+				time.Sleep(50 * time.Millisecond)
 			})
 
 			It("decodes the token from the Token field", func() {
@@ -254,7 +251,7 @@ var _ = Describe("Server", func() {
 					close(done)
 					return false
 				}
-				token, err := serv.tokenGenerator.NewRetryToken(raddr, nil)
+				token, err := serv.tokenGenerator.NewRetryToken(raddr, nil, nil)
 				Expect(err).ToNot(HaveOccurred())
 				packet := getPacket(&wire.Header{
 					IsLongHeader: true,
@@ -263,6 +260,8 @@ var _ = Describe("Server", func() {
 					Version:      serv.config.Versions[0],
 				}, make([]byte, protocol.MinInitialPacketSize))
 				packet.remoteAddr = raddr
+				conn.EXPECT().WriteTo(gomock.Any(), gomock.Any()).MaxTimes(1)
+				tracer.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).MaxTimes(1)
 				serv.handlePacket(packet)
 				Eventually(done).Should(BeClosed())
 			})
@@ -286,147 +285,66 @@ var _ = Describe("Server", func() {
 					Version:      serv.config.Versions[0],
 				}, make([]byte, protocol.MinInitialPacketSize))
 				packet.remoteAddr = raddr
+				conn.EXPECT().WriteTo(gomock.Any(), gomock.Any()).MaxTimes(1)
+				tracer.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).MaxTimes(1)
 				serv.handlePacket(packet)
 				Eventually(done).Should(BeClosed())
 			})
 
-			It("sends a Version Negotiation Packet for unsupported versions", func() {
-				srcConnID := protocol.ConnectionID{1, 2, 3, 4, 5}
-				destConnID := protocol.ConnectionID{1, 2, 3, 4, 5, 6}
-				packet := getPacket(&wire.Header{
-					IsLongHeader:     true,
-					Type:             protocol.PacketTypeHandshake,
-					SrcConnectionID:  srcConnID,
-					DestConnectionID: destConnID,
-					Version:          0x42,
-				}, make([]byte, protocol.MinInitialPacketSize))
-				packet.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
-				serv.handlePacket(packet)
-				var write mockPacketConnWrite
-				Eventually(conn.dataWritten).Should(Receive(&write))
-				Expect(write.to.String()).To(Equal("127.0.0.1:1337"))
-				Expect(wire.IsVersionNegotiationPacket(write.data)).To(BeTrue())
-				hdr := parseHeader(write.data)
-				Expect(hdr.DestConnectionID).To(Equal(srcConnID))
-				Expect(hdr.SrcConnectionID).To(Equal(destConnID))
-				Expect(hdr.SupportedVersions).ToNot(ContainElement(protocol.VersionNumber(0x42)))
-			})
-
-			It("replies with a Retry packet, if a Token is required", func() {
-				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return false }
-				hdr := &wire.Header{
-					IsLongHeader:     true,
-					Type:             protocol.PacketTypeInitial,
-					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
-					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-					Version:          protocol.VersionTLS,
-				}
-				packet := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
-				packet.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
-				serv.handlePacket(packet)
-				var write mockPacketConnWrite
-				Eventually(conn.dataWritten).Should(Receive(&write))
-				Expect(write.to.String()).To(Equal("127.0.0.1:1337"))
-				replyHdr := parseHeader(write.data)
-				Expect(replyHdr.Type).To(Equal(protocol.PacketTypeRetry))
-				Expect(replyHdr.SrcConnectionID).ToNot(Equal(hdr.DestConnectionID))
-				Expect(replyHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
-				Expect(replyHdr.Token).ToNot(BeEmpty())
-				Expect(write.data[len(write.data)-16:]).To(Equal(handshake.GetRetryIntegrityTag(write.data[:len(write.data)-16], hdr.DestConnectionID)[:]))
-			})
-
-			It("sends an INVALID_TOKEN error, if an invalid retry token is received", func() {
-				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return false }
-				token, err := serv.tokenGenerator.NewRetryToken(&net.UDPAddr{}, nil)
+			It("creates a session when the token is accepted", func() {
+				serv.config.AcceptToken = func(_ net.Addr, token *Token) bool { return true }
+				retryToken, err := serv.tokenGenerator.NewRetryToken(
+					&net.UDPAddr{},
+					protocol.ConnectionID{0xde, 0xad, 0xc0, 0xde},
+					protocol.ConnectionID{0xde, 0xca, 0xfb, 0xad},
+				)
 				Expect(err).ToNot(HaveOccurred())
 				hdr := &wire.Header{
 					IsLongHeader:     true,
 					Type:             protocol.PacketTypeInitial,
 					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
 					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-					Token:            token,
 					Version:          protocol.VersionTLS,
-				}
-				packet := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
-				packet.data = append(packet.data, []byte("coalesced packet")...) // add some garbage to simulate a coalesced packet
-				packet.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
-				serv.handlePacket(packet)
-				var write mockPacketConnWrite
-				Eventually(conn.dataWritten).Should(Receive(&write))
-				Expect(write.to.String()).To(Equal("127.0.0.1:1337"))
-				replyHdr := parseHeader(write.data)
-				Expect(replyHdr.Type).To(Equal(protocol.PacketTypeInitial))
-				Expect(replyHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
-				Expect(replyHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
-				_, opener := handshake.NewInitialAEAD(hdr.DestConnectionID, protocol.PerspectiveClient)
-				extHdr, err := unpackHeader(opener, replyHdr, write.data, hdr.Version)
-				Expect(err).ToNot(HaveOccurred())
-				data, err := opener.Open(nil, write.data[extHdr.ParsedLen():], extHdr.PacketNumber, write.data[:extHdr.ParsedLen()])
-				Expect(err).ToNot(HaveOccurred())
-				f, err := wire.NewFrameParser(hdr.Version).ParseNext(bytes.NewReader(data), protocol.EncryptionInitial)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(f).To(BeAssignableToTypeOf(&wire.ConnectionCloseFrame{}))
-				ccf := f.(*wire.ConnectionCloseFrame)
-				Expect(ccf.ErrorCode).To(Equal(qerr.InvalidToken))
-				Expect(ccf.ReasonPhrase).To(BeEmpty())
-			})
-
-			It("doesn't send an INVALID_TOKEN error, if the packet is corrupted", func() {
-				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return false }
-				token, err := serv.tokenGenerator.NewRetryToken(&net.UDPAddr{}, nil)
-				Expect(err).ToNot(HaveOccurred())
-				hdr := &wire.Header{
-					IsLongHeader:     true,
-					Type:             protocol.PacketTypeInitial,
-					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
-					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-					Token:            token,
-					Version:          protocol.VersionTLS,
-				}
-				packet := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
-				packet.data[len(packet.data)-10] ^= 0xff // corrupt the packet
-				packet.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
-				serv.handlePacket(packet)
-				Consistently(conn.dataWritten).ShouldNot(Receive())
-			})
-
-			It("creates a session, if no Token is required", func() {
-				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return true }
-				hdr := &wire.Header{
-					IsLongHeader:     true,
-					Type:             protocol.PacketTypeInitial,
-					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
-					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-					Version:          protocol.VersionTLS,
+					Token:            retryToken,
 				}
 				p := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
 				run := make(chan struct{})
-				var token [16]byte
+				var token protocol.StatelessResetToken
 				rand.Read(token[:])
+
 				var newConnID protocol.ConnectionID
-				phm.EXPECT().GetStatelessResetToken(gomock.Any()).DoAndReturn(func(c protocol.ConnectionID) [16]byte {
+				phm.EXPECT().AddWithConnID(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, gomock.Any(), gomock.Any()).DoAndReturn(func(_, c protocol.ConnectionID, fn func() packetHandler) bool {
 					newConnID = c
-					return token
+					phm.EXPECT().GetStatelessResetToken(gomock.Any()).DoAndReturn(func(c protocol.ConnectionID) protocol.StatelessResetToken {
+						newConnID = c
+						return token
+					})
+					fn()
+					return true
 				})
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, protocol.ConnectionID{0xde, 0xad, 0xc0, 0xde})
 				sess := NewMockQuicSession(mockCtrl)
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					_ sessionRunner,
-					_ protocol.ConnectionID,
-					origConnID protocol.ConnectionID,
+					origDestConnID protocol.ConnectionID,
+					retrySrcConnID *protocol.ConnectionID,
+					clientDestConnID protocol.ConnectionID,
 					destConnID protocol.ConnectionID,
 					srcConnID protocol.ConnectionID,
-					tokenP [16]byte,
+					tokenP protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					enable0RTT bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
 					Expect(enable0RTT).To(BeFalse())
-					Expect(origConnID).To(Equal(hdr.DestConnectionID))
+					Expect(origDestConnID).To(Equal(protocol.ConnectionID{0xde, 0xad, 0xc0, 0xde}))
+					Expect(retrySrcConnID).To(Equal(&protocol.ConnectionID{0xde, 0xca, 0xfb, 0xad}))
+					Expect(clientDestConnID).To(Equal(hdr.DestConnectionID))
 					Expect(destConnID).To(Equal(hdr.SrcConnectionID))
 					// make sure we're using a server-generated connection ID
 					Expect(srcConnID).ToNot(Equal(hdr.DestConnectionID))
@@ -440,18 +358,270 @@ var _ = Describe("Server", func() {
 					return sess
 				}
 
-				phm.EXPECT().Add(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, sess).Return(true)
-				phm.EXPECT().Add(gomock.Any(), sess).DoAndReturn(func(c protocol.ConnectionID, _ packetHandler) bool {
-					Expect(c).To(Equal(newConnID))
+				done := make(chan struct{})
+				go func() {
+					defer GinkgoRecover()
+					serv.handlePacket(p)
+					// the Handshake packet is written by the session.
+					// Make sure there are no Write calls on the packet conn.
+					time.Sleep(50 * time.Millisecond)
+					close(done)
+				}()
+				// make sure we're using a server-generated connection ID
+				Eventually(run).Should(BeClosed())
+				Eventually(done).Should(BeClosed())
+			})
+
+			It("sends a Version Negotiation Packet for unsupported versions", func() {
+				srcConnID := protocol.ConnectionID{1, 2, 3, 4, 5}
+				destConnID := protocol.ConnectionID{1, 2, 3, 4, 5, 6}
+				packet := getPacket(&wire.Header{
+					IsLongHeader:     true,
+					Type:             protocol.PacketTypeHandshake,
+					SrcConnectionID:  srcConnID,
+					DestConnectionID: destConnID,
+					Version:          0x42,
+				}, make([]byte, protocol.MinUnknownVersionPacketSize))
+				raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
+				packet.remoteAddr = raddr
+				tracer.EXPECT().SentPacket(packet.remoteAddr, gomock.Any(), gomock.Any(), nil).Do(func(_ net.Addr, replyHdr *logging.Header, _ logging.ByteCount, _ []logging.Frame) {
+					Expect(replyHdr.IsLongHeader).To(BeTrue())
+					Expect(replyHdr.Version).To(BeZero())
+					Expect(replyHdr.SrcConnectionID).To(Equal(destConnID))
+					Expect(replyHdr.DestConnectionID).To(Equal(srcConnID))
+				})
+				done := make(chan struct{})
+				conn.EXPECT().WriteTo(gomock.Any(), raddr).DoAndReturn(func(b []byte, _ net.Addr) (int, error) {
+					defer close(done)
+					Expect(wire.IsVersionNegotiationPacket(b)).To(BeTrue())
+					hdr, versions, err := wire.ParseVersionNegotiationPacket(bytes.NewReader(b))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(hdr.DestConnectionID).To(Equal(srcConnID))
+					Expect(hdr.SrcConnectionID).To(Equal(destConnID))
+					Expect(versions).ToNot(ContainElement(protocol.VersionNumber(0x42)))
+					return len(b), nil
+				})
+				serv.handlePacket(packet)
+				Eventually(done).Should(BeClosed())
+			})
+
+			It("ignores Version Negotiation packets", func() {
+				data, err := wire.ComposeVersionNegotiation(
+					protocol.ConnectionID{1, 2, 3, 4},
+					protocol.ConnectionID{4, 3, 2, 1},
+					[]protocol.VersionNumber{1, 2, 3},
+				)
+				Expect(err).ToNot(HaveOccurred())
+				raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
+				done := make(chan struct{})
+				tracer.EXPECT().DroppedPacket(raddr, logging.PacketTypeVersionNegotiation, protocol.ByteCount(len(data)), logging.PacketDropUnexpectedPacket).Do(func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) {
+					close(done)
+				})
+				serv.handlePacket(&receivedPacket{
+					remoteAddr: raddr,
+					data:       data,
+					buffer:     getPacketBuffer(),
+				})
+				Eventually(done).Should(BeClosed())
+				// make sure no other packet is sent
+				time.Sleep(scaleDuration(20 * time.Millisecond))
+			})
+
+			It("doesn't send a Version Negotiation Packet for unsupported versions, if the packet is too small", func() {
+				srcConnID := protocol.ConnectionID{1, 2, 3, 4, 5}
+				destConnID := protocol.ConnectionID{1, 2, 3, 4, 5, 6}
+				p := getPacket(&wire.Header{
+					IsLongHeader:     true,
+					Type:             protocol.PacketTypeHandshake,
+					SrcConnectionID:  srcConnID,
+					DestConnectionID: destConnID,
+					Version:          0x42,
+				}, make([]byte, protocol.MinUnknownVersionPacketSize-50))
+				Expect(p.Size()).To(BeNumerically("<", protocol.MinUnknownVersionPacketSize))
+				raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
+				p.remoteAddr = raddr
+				done := make(chan struct{})
+				tracer.EXPECT().DroppedPacket(raddr, logging.PacketTypeNotDetermined, p.Size(), logging.PacketDropUnexpectedPacket).Do(func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) {
+					close(done)
+				})
+				serv.handlePacket(p)
+				Eventually(done).Should(BeClosed())
+				// make sure no other packet is sent
+				time.Sleep(scaleDuration(20 * time.Millisecond))
+			})
+
+			It("replies with a Retry packet, if a Token is required", func() {
+				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return false }
+				hdr := &wire.Header{
+					IsLongHeader:     true,
+					Type:             protocol.PacketTypeInitial,
+					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
+					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					Version:          protocol.VersionTLS,
+				}
+				packet := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
+				raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
+				packet.remoteAddr = raddr
+				tracer.EXPECT().SentPacket(packet.remoteAddr, gomock.Any(), gomock.Any(), nil).Do(func(_ net.Addr, replyHdr *logging.Header, _ logging.ByteCount, _ []logging.Frame) {
+					Expect(replyHdr.Type).To(Equal(protocol.PacketTypeRetry))
+					Expect(replyHdr.SrcConnectionID).ToNot(Equal(hdr.DestConnectionID))
+					Expect(replyHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
+					Expect(replyHdr.Token).ToNot(BeEmpty())
+				})
+				done := make(chan struct{})
+				conn.EXPECT().WriteTo(gomock.Any(), raddr).DoAndReturn(func(b []byte, _ net.Addr) (int, error) {
+					defer close(done)
+					replyHdr := parseHeader(b)
+					Expect(replyHdr.Type).To(Equal(protocol.PacketTypeRetry))
+					Expect(replyHdr.SrcConnectionID).ToNot(Equal(hdr.DestConnectionID))
+					Expect(replyHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
+					Expect(replyHdr.Token).ToNot(BeEmpty())
+					Expect(b[len(b)-16:]).To(Equal(handshake.GetRetryIntegrityTag(b[:len(b)-16], hdr.DestConnectionID)[:]))
+					return len(b), nil
+				})
+				serv.handlePacket(packet)
+				Eventually(done).Should(BeClosed())
+			})
+
+			It("sends an INVALID_TOKEN error, if an invalid retry token is received", func() {
+				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return false }
+				token, err := serv.tokenGenerator.NewRetryToken(&net.UDPAddr{}, nil, nil)
+				Expect(err).ToNot(HaveOccurred())
+				hdr := &wire.Header{
+					IsLongHeader:     true,
+					Type:             protocol.PacketTypeInitial,
+					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
+					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					Token:            token,
+					Version:          protocol.VersionTLS,
+				}
+				packet := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
+				packet.data = append(packet.data, []byte("coalesced packet")...) // add some garbage to simulate a coalesced packet
+				raddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
+				packet.remoteAddr = raddr
+				tracer.EXPECT().SentPacket(packet.remoteAddr, gomock.Any(), gomock.Any(), gomock.Any()).Do(func(_ net.Addr, replyHdr *logging.Header, _ logging.ByteCount, frames []logging.Frame) {
+					Expect(replyHdr.Type).To(Equal(protocol.PacketTypeInitial))
+					Expect(replyHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
+					Expect(replyHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
+					Expect(frames).To(HaveLen(1))
+					Expect(frames[0]).To(BeAssignableToTypeOf(&wire.ConnectionCloseFrame{}))
+					ccf := frames[0].(*logging.ConnectionCloseFrame)
+					Expect(ccf.IsApplicationError).To(BeFalse())
+					Expect(ccf.ErrorCode).To(Equal(qerr.InvalidToken))
+				})
+				done := make(chan struct{})
+				conn.EXPECT().WriteTo(gomock.Any(), raddr).DoAndReturn(func(b []byte, _ net.Addr) (int, error) {
+					defer close(done)
+					replyHdr := parseHeader(b)
+					Expect(replyHdr.Type).To(Equal(protocol.PacketTypeInitial))
+					Expect(replyHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
+					Expect(replyHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
+					_, opener := handshake.NewInitialAEAD(hdr.DestConnectionID, protocol.PerspectiveClient)
+					extHdr, err := unpackHeader(opener, replyHdr, b, hdr.Version)
+					Expect(err).ToNot(HaveOccurred())
+					data, err := opener.Open(nil, b[extHdr.ParsedLen():], extHdr.PacketNumber, b[:extHdr.ParsedLen()])
+					Expect(err).ToNot(HaveOccurred())
+					f, err := wire.NewFrameParser(hdr.Version).ParseNext(bytes.NewReader(data), protocol.EncryptionInitial)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(f).To(BeAssignableToTypeOf(&wire.ConnectionCloseFrame{}))
+					ccf := f.(*wire.ConnectionCloseFrame)
+					Expect(ccf.ErrorCode).To(Equal(qerr.InvalidToken))
+					Expect(ccf.ReasonPhrase).To(BeEmpty())
+					return len(b), nil
+				})
+				serv.handlePacket(packet)
+				Eventually(done).Should(BeClosed())
+			})
+
+			It("doesn't send an INVALID_TOKEN error, if the packet is corrupted", func() {
+				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return false }
+				token, err := serv.tokenGenerator.NewRetryToken(&net.UDPAddr{}, nil, nil)
+				Expect(err).ToNot(HaveOccurred())
+				hdr := &wire.Header{
+					IsLongHeader:     true,
+					Type:             protocol.PacketTypeInitial,
+					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
+					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					Token:            token,
+					Version:          protocol.VersionTLS,
+				}
+				packet := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
+				packet.data[len(packet.data)-10] ^= 0xff // corrupt the packet
+				packet.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1337}
+				tracer.EXPECT().DroppedPacket(packet.remoteAddr, logging.PacketTypeInitial, packet.Size(), logging.PacketDropPayloadDecryptError)
+				serv.handlePacket(packet)
+				// make sure there are no Write calls on the packet conn
+				time.Sleep(50 * time.Millisecond)
+			})
+
+			It("creates a session, if no Token is required", func() {
+				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return true }
+				hdr := &wire.Header{
+					IsLongHeader:     true,
+					Type:             protocol.PacketTypeInitial,
+					SrcConnectionID:  protocol.ConnectionID{5, 4, 3, 2, 1},
+					DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
+					Version:          protocol.VersionTLS,
+				}
+				p := getPacket(hdr, make([]byte, protocol.MinInitialPacketSize))
+				run := make(chan struct{})
+				var token protocol.StatelessResetToken
+				rand.Read(token[:])
+
+				var newConnID protocol.ConnectionID
+				phm.EXPECT().AddWithConnID(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, gomock.Any(), gomock.Any()).DoAndReturn(func(_, c protocol.ConnectionID, fn func() packetHandler) bool {
+					newConnID = c
+					phm.EXPECT().GetStatelessResetToken(gomock.Any()).DoAndReturn(func(c protocol.ConnectionID) protocol.StatelessResetToken {
+						newConnID = c
+						return token
+					})
+					fn()
 					return true
 				})
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+
+				sess := NewMockQuicSession(mockCtrl)
+				serv.newSession = func(
+					_ sendConn,
+					_ sessionRunner,
+					origDestConnID protocol.ConnectionID,
+					retrySrcConnID *protocol.ConnectionID,
+					clientDestConnID protocol.ConnectionID,
+					destConnID protocol.ConnectionID,
+					srcConnID protocol.ConnectionID,
+					tokenP protocol.StatelessResetToken,
+					_ *Config,
+					_ *tls.Config,
+					_ *handshake.TokenGenerator,
+					enable0RTT bool,
+					_ logging.ConnectionTracer,
+					_ utils.Logger,
+					_ protocol.VersionNumber,
+				) quicSession {
+					Expect(enable0RTT).To(BeFalse())
+					Expect(origDestConnID).To(Equal(hdr.DestConnectionID))
+					Expect(retrySrcConnID).To(BeNil())
+					Expect(clientDestConnID).To(Equal(hdr.DestConnectionID))
+					Expect(destConnID).To(Equal(hdr.SrcConnectionID))
+					// make sure we're using a server-generated connection ID
+					Expect(srcConnID).ToNot(Equal(hdr.DestConnectionID))
+					Expect(srcConnID).ToNot(Equal(hdr.SrcConnectionID))
+					Expect(srcConnID).To(Equal(newConnID))
+					Expect(tokenP).To(Equal(token))
+					sess.EXPECT().handlePacket(p)
+					sess.EXPECT().run().Do(func() { close(run) })
+					sess.EXPECT().Context().Return(context.Background())
+					sess.EXPECT().HandshakeComplete().Return(context.Background())
+					return sess
+				}
 
 				done := make(chan struct{})
 				go func() {
 					defer GinkgoRecover()
 					serv.handlePacket(p)
 					// the Handshake packet is written by the session
-					Consistently(conn.dataWritten).ShouldNot(Receive())
+					// make sure there are no Write calls on the packet conn
+					time.Sleep(50 * time.Millisecond)
 					close(done)
 				}()
 				// make sure we're using a server-generated connection ID
@@ -480,18 +650,19 @@ var _ = Describe("Server", func() {
 					sess.EXPECT().handlePacket(zeroRTTPacket),
 				)
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					runner sessionRunner,
 					_ protocol.ConnectionID,
+					_ *protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
-					_ [16]byte,
+					_ protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					_ bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
@@ -503,40 +674,56 @@ var _ = Describe("Server", func() {
 				Expect(serv.handlePacketImpl(zeroRTTPacket)).To(BeTrue())
 				// Then receive the Initial packet.
 				phm.EXPECT().GetStatelessResetToken(gomock.Any())
-				phm.EXPECT().Add(gomock.Any(), sess).Return(true).Times(2)
+				phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+					fn()
+					return true
+				})
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, gomock.Any())
 				Expect(serv.handlePacketImpl(initialPacket)).To(BeTrue())
 				Expect(createdSession).To(BeTrue())
 			})
 
 			It("drops packets if the receive queue is full", func() {
-				phm.EXPECT().GetStatelessResetToken(gomock.Any()).AnyTimes()
-				phm.EXPECT().Add(gomock.Any(), gomock.Any()).AnyTimes()
+				phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+					phm.EXPECT().GetStatelessResetToken(gomock.Any())
+					fn()
+					return true
+				}).AnyTimes()
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, gomock.Any()).AnyTimes()
 
 				serv.config.AcceptToken = func(net.Addr, *Token) bool { return true }
 				acceptSession := make(chan struct{})
 				var counter uint32 // to be used as an atomic, so we query it in Eventually
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					runner sessionRunner,
 					_ protocol.ConnectionID,
+					_ *protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
-					_ [16]byte,
+					_ protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					_ bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
 					<-acceptSession
 					atomic.AddUint32(&counter, 1)
-					return nil
+					sess := NewMockQuicSession(mockCtrl)
+					sess.EXPECT().handlePacket(gomock.Any()).MaxTimes(1)
+					sess.EXPECT().run().MaxTimes(1)
+					sess.EXPECT().Context().Return(context.Background()).MaxTimes(1)
+					sess.EXPECT().HandshakeComplete().Return(context.Background()).MaxTimes(1)
+					return sess
 				}
 
-				serv.handlePacket(getInitial(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}))
+				p := getInitial(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8})
+				serv.handlePacket(p)
+				tracer.EXPECT().DroppedPacket(p.remoteAddr, logging.PacketTypeNotDetermined, p.Size(), logging.PacketDropDOSPrevention).MinTimes(1)
 				var wg sync.WaitGroup
 				for i := 0; i < 3*protocol.MaxServerUnprocessedPackets; i++ {
 					wg.Add(1)
@@ -549,7 +736,10 @@ var _ = Describe("Server", func() {
 				wg.Wait()
 
 				close(acceptSession)
-				Eventually(func() uint32 { return atomic.LoadUint32(&counter) }).Should(BeEquivalentTo(protocol.MaxServerUnprocessedPackets + 1))
+				Eventually(
+					func() uint32 { return atomic.LoadUint32(&counter) },
+					scaleDuration(100*time.Millisecond),
+				).Should(BeEquivalentTo(protocol.MaxServerUnprocessedPackets + 1))
 				Consistently(func() uint32 { return atomic.LoadUint32(&counter) }).Should(BeEquivalentTo(protocol.MaxServerUnprocessedPackets + 1))
 			})
 
@@ -558,18 +748,19 @@ var _ = Describe("Server", func() {
 				var createdSession bool
 				sess := NewMockQuicSession(mockCtrl)
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					runner sessionRunner,
 					_ protocol.ConnectionID,
+					_ *protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
-					_ [16]byte,
+					_ protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					_ bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
@@ -578,28 +769,28 @@ var _ = Describe("Server", func() {
 				}
 
 				p := getInitial(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9})
-				phm.EXPECT().GetStatelessResetToken(gomock.Any())
-				phm.EXPECT().Add(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9}, sess).Return(false)
-				Expect(serv.handlePacketImpl(p)).To(BeFalse())
-				Expect(createdSession).To(BeTrue())
+				phm.EXPECT().AddWithConnID(protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8, 9}, gomock.Any(), gomock.Any()).Return(false)
+				Expect(serv.handlePacketImpl(p)).To(BeTrue())
+				Expect(createdSession).To(BeFalse())
 			})
 
 			It("rejects new connection attempts if the accept queue is full", func() {
 				serv.config.AcceptToken = func(_ net.Addr, _ *Token) bool { return true }
 
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					runner sessionRunner,
 					_ protocol.ConnectionID,
+					_ *protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
-					_ [16]byte,
+					_ protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					_ bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
@@ -613,8 +804,12 @@ var _ = Describe("Server", func() {
 					return sess
 				}
 
-				phm.EXPECT().GetStatelessResetToken(gomock.Any()).Times(protocol.MaxAcceptQueueSize)
-				phm.EXPECT().Add(gomock.Any(), gomock.Any()).Return(true).Times(2 * protocol.MaxAcceptQueueSize)
+				phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+					phm.EXPECT().GetStatelessResetToken(gomock.Any())
+					fn()
+					return true
+				}).Times(protocol.MaxAcceptQueueSize)
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, gomock.Any()).Times(protocol.MaxAcceptQueueSize)
 
 				var wg sync.WaitGroup
 				wg.Add(protocol.MaxAcceptQueueSize)
@@ -623,22 +818,27 @@ var _ = Describe("Server", func() {
 						defer GinkgoRecover()
 						defer wg.Done()
 						serv.handlePacket(getInitialWithRandomDestConnID())
-						Consistently(conn.dataWritten).ShouldNot(Receive())
+						// make sure there are no Write calls on the packet conn
+						time.Sleep(50 * time.Millisecond)
 					}()
 				}
 				wg.Wait()
 				p := getInitialWithRandomDestConnID()
 				hdr, _, _, err := wire.ParsePacket(p.data, 0)
 				Expect(err).ToNot(HaveOccurred())
+				tracer.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
+				done := make(chan struct{})
+				conn.EXPECT().WriteTo(gomock.Any(), p.remoteAddr).DoAndReturn(func(b []byte, _ net.Addr) (int, error) {
+					defer close(done)
+					rejectHdr := parseHeader(b)
+					Expect(rejectHdr.Type).To(Equal(protocol.PacketTypeInitial))
+					Expect(rejectHdr.Version).To(Equal(hdr.Version))
+					Expect(rejectHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
+					Expect(rejectHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
+					return len(b), nil
+				})
 				serv.handlePacket(p)
-				var reject mockPacketConnWrite
-				Eventually(conn.dataWritten).Should(Receive(&reject))
-				Expect(reject.to).To(Equal(p.remoteAddr))
-				rejectHdr := parseHeader(reject.data)
-				Expect(rejectHdr.Type).To(Equal(protocol.PacketTypeInitial))
-				Expect(rejectHdr.Version).To(Equal(hdr.Version))
-				Expect(rejectHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
-				Expect(rejectHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
+				Eventually(done).Should(BeClosed())
 			})
 
 			It("doesn't accept new sessions if they were closed in the mean time", func() {
@@ -649,18 +849,19 @@ var _ = Describe("Server", func() {
 				sessionCreated := make(chan struct{})
 				sess := NewMockQuicSession(mockCtrl)
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					runner sessionRunner,
 					_ protocol.ConnectionID,
+					_ *protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
-					_ [16]byte,
+					_ protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					_ bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
@@ -674,11 +875,16 @@ var _ = Describe("Server", func() {
 					return sess
 				}
 
-				phm.EXPECT().GetStatelessResetToken(gomock.Any())
-				phm.EXPECT().Add(gomock.Any(), gomock.Any()).Return(true).Times(2)
+				phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+					phm.EXPECT().GetStatelessResetToken(gomock.Any())
+					fn()
+					return true
+				})
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, gomock.Any())
 
 				serv.handlePacket(p)
-				Consistently(conn.dataWritten).ShouldNot(Receive())
+				// make sure there are no Write calls on the packet conn
+				time.Sleep(50 * time.Millisecond)
 				Eventually(sessionCreated).Should(BeClosed())
 				cancel()
 				time.Sleep(scaleDuration(200 * time.Millisecond))
@@ -753,18 +959,19 @@ var _ = Describe("Server", func() {
 
 				ctx, cancel := context.WithCancel(context.Background()) // handshake context
 				serv.newSession = func(
-					_ connection,
+					_ sendConn,
 					runner sessionRunner,
 					_ protocol.ConnectionID,
+					_ *protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
-					_ [16]byte,
+					_ protocol.StatelessResetToken,
 					_ *Config,
 					_ *tls.Config,
 					_ *handshake.TokenGenerator,
 					_ bool,
-					_ qlog.Tracer,
+					_ logging.ConnectionTracer,
 					_ utils.Logger,
 					_ protocol.VersionNumber,
 				) quicSession {
@@ -773,9 +980,13 @@ var _ = Describe("Server", func() {
 					sess.EXPECT().Context().Return(context.Background())
 					return sess
 				}
-				phm.EXPECT().GetStatelessResetToken(gomock.Any())
-				phm.EXPECT().Add(gomock.Any(), gomock.Any()).Return(true).Times(2)
-				serv.createNewSession(&net.UDPAddr{}, nil, nil, nil, nil, protocol.VersionWhatever)
+				phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+					phm.EXPECT().GetStatelessResetToken(gomock.Any())
+					fn()
+					return true
+				})
+				tracer.EXPECT().TracerForConnection(protocol.PerspectiveServer, gomock.Any())
+				serv.createNewSession(&net.UDPAddr{}, nil, nil, nil, nil, nil, protocol.VersionWhatever)
 				Consistently(done).ShouldNot(BeClosed())
 				cancel() // complete the handshake
 				Eventually(done).Should(BeClosed())
@@ -816,18 +1027,19 @@ var _ = Describe("Server", func() {
 
 			ready := make(chan struct{})
 			serv.newSession = func(
-				_ connection,
+				_ sendConn,
 				runner sessionRunner,
 				_ protocol.ConnectionID,
+				_ *protocol.ConnectionID,
 				_ protocol.ConnectionID,
 				_ protocol.ConnectionID,
 				_ protocol.ConnectionID,
-				_ [16]byte,
+				_ protocol.StatelessResetToken,
 				_ *Config,
 				_ *tls.Config,
 				_ *handshake.TokenGenerator,
 				enable0RTT bool,
-				_ qlog.Tracer,
+				_ logging.ConnectionTracer,
 				_ utils.Logger,
 				_ protocol.VersionNumber,
 			) quicSession {
@@ -837,9 +1049,12 @@ var _ = Describe("Server", func() {
 				sess.EXPECT().Context().Return(context.Background())
 				return sess
 			}
-			phm.EXPECT().GetStatelessResetToken(gomock.Any())
-			phm.EXPECT().Add(gomock.Any(), sess).Return(true).Times(2)
-			serv.createNewSession(&net.UDPAddr{}, nil, nil, nil, nil, protocol.VersionWhatever)
+			phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+				phm.EXPECT().GetStatelessResetToken(gomock.Any())
+				fn()
+				return true
+			})
+			serv.createNewSession(&net.UDPAddr{}, nil, nil, nil, nil, nil, protocol.VersionWhatever)
 			Consistently(done).ShouldNot(BeClosed())
 			close(ready)
 			Eventually(done).Should(BeClosed())
@@ -850,18 +1065,19 @@ var _ = Describe("Server", func() {
 			senderAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 42}
 
 			serv.newSession = func(
-				_ connection,
+				_ sendConn,
 				runner sessionRunner,
 				_ protocol.ConnectionID,
+				_ *protocol.ConnectionID,
 				_ protocol.ConnectionID,
 				_ protocol.ConnectionID,
 				_ protocol.ConnectionID,
-				_ [16]byte,
+				_ protocol.StatelessResetToken,
 				_ *Config,
 				_ *tls.Config,
 				_ *handshake.TokenGenerator,
 				_ bool,
-				_ qlog.Tracer,
+				_ logging.ConnectionTracer,
 				_ utils.Logger,
 				_ protocol.VersionNumber,
 			) quicSession {
@@ -875,26 +1091,33 @@ var _ = Describe("Server", func() {
 				return sess
 			}
 
-			phm.EXPECT().GetStatelessResetToken(gomock.Any()).Times(protocol.MaxAcceptQueueSize)
-			phm.EXPECT().Add(gomock.Any(), gomock.Any()).Return(true).Times(2 * protocol.MaxAcceptQueueSize)
+			phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+				phm.EXPECT().GetStatelessResetToken(gomock.Any())
+				fn()
+				return true
+			}).Times(protocol.MaxAcceptQueueSize)
 			for i := 0; i < protocol.MaxAcceptQueueSize; i++ {
 				serv.handlePacket(getInitialWithRandomDestConnID())
 			}
 
 			Eventually(func() int32 { return atomic.LoadInt32(&serv.sessionQueueLen) }).Should(BeEquivalentTo(protocol.MaxAcceptQueueSize))
-			Consistently(conn.dataWritten).ShouldNot(Receive())
+			// make sure there are no Write calls on the packet conn
+			time.Sleep(50 * time.Millisecond)
 
 			p := getInitialWithRandomDestConnID()
 			hdr := parseHeader(p.data)
+			done := make(chan struct{})
+			conn.EXPECT().WriteTo(gomock.Any(), senderAddr).DoAndReturn(func(b []byte, _ net.Addr) (int, error) {
+				defer close(done)
+				rejectHdr := parseHeader(b)
+				Expect(rejectHdr.Type).To(Equal(protocol.PacketTypeInitial))
+				Expect(rejectHdr.Version).To(Equal(hdr.Version))
+				Expect(rejectHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
+				Expect(rejectHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
+				return len(b), nil
+			})
 			serv.handlePacket(p)
-			var reject mockPacketConnWrite
-			Eventually(conn.dataWritten).Should(Receive(&reject))
-			Expect(reject.to).To(Equal(senderAddr))
-			rejectHdr := parseHeader(reject.data)
-			Expect(rejectHdr.Type).To(Equal(protocol.PacketTypeInitial))
-			Expect(rejectHdr.Version).To(Equal(hdr.Version))
-			Expect(rejectHdr.DestConnectionID).To(Equal(hdr.SrcConnectionID))
-			Expect(rejectHdr.SrcConnectionID).To(Equal(hdr.DestConnectionID))
+			Eventually(done).Should(BeClosed())
 		})
 
 		It("doesn't accept new sessions if they were closed in the mean time", func() {
@@ -905,18 +1128,19 @@ var _ = Describe("Server", func() {
 			sessionCreated := make(chan struct{})
 			sess := NewMockQuicSession(mockCtrl)
 			serv.newSession = func(
-				_ connection,
+				_ sendConn,
 				runner sessionRunner,
 				_ protocol.ConnectionID,
+				_ *protocol.ConnectionID,
 				_ protocol.ConnectionID,
 				_ protocol.ConnectionID,
 				_ protocol.ConnectionID,
-				_ [16]byte,
+				_ protocol.StatelessResetToken,
 				_ *Config,
 				_ *tls.Config,
 				_ *handshake.TokenGenerator,
 				_ bool,
-				_ qlog.Tracer,
+				_ logging.ConnectionTracer,
 				_ utils.Logger,
 				_ protocol.VersionNumber,
 			) quicSession {
@@ -928,10 +1152,14 @@ var _ = Describe("Server", func() {
 				return sess
 			}
 
-			phm.EXPECT().GetStatelessResetToken(gomock.Any())
-			phm.EXPECT().Add(gomock.Any(), sess).Return(true).Times(2)
+			phm.EXPECT().AddWithConnID(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(_, _ protocol.ConnectionID, fn func() packetHandler) bool {
+				phm.EXPECT().GetStatelessResetToken(gomock.Any())
+				fn()
+				return true
+			})
 			serv.handlePacket(p)
-			Consistently(conn.dataWritten).ShouldNot(Receive())
+			// make sure there are no Write calls on the packet conn
+			time.Sleep(50 * time.Millisecond)
 			Eventually(sessionCreated).Should(BeClosed())
 			cancel()
 			time.Sleep(scaleDuration(200 * time.Millisecond))

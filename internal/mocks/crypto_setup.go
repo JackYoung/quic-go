@@ -10,7 +10,7 @@ import (
 	gomock "github.com/golang/mock/gomock"
 	handshake "github.com/lucas-clemente/quic-go/internal/handshake"
 	protocol "github.com/lucas-clemente/quic-go/internal/protocol"
-	qtls "github.com/marten-seemann/qtls"
+	qtls "github.com/lucas-clemente/quic-go/internal/qtls"
 )
 
 // MockCryptoSetup is a mock of CryptoSetup interface
@@ -74,18 +74,6 @@ func (m *MockCryptoSetup) ConnectionState() qtls.ConnectionState {
 func (mr *MockCryptoSetupMockRecorder) ConnectionState() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConnectionState", reflect.TypeOf((*MockCryptoSetup)(nil).ConnectionState))
-}
-
-// DropHandshakeKeys mocks base method
-func (m *MockCryptoSetup) DropHandshakeKeys() {
-	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "DropHandshakeKeys")
-}
-
-// DropHandshakeKeys indicates an expected call of DropHandshakeKeys
-func (mr *MockCryptoSetupMockRecorder) DropHandshakeKeys() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DropHandshakeKeys", reflect.TypeOf((*MockCryptoSetup)(nil).DropHandshakeKeys))
 }
 
 // Get0RTTOpener mocks base method
@@ -249,10 +237,24 @@ func (mr *MockCryptoSetupMockRecorder) RunHandshake() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RunHandshake", reflect.TypeOf((*MockCryptoSetup)(nil).RunHandshake))
 }
 
-// SetLargest1RTTAcked mocks base method
-func (m *MockCryptoSetup) SetLargest1RTTAcked(arg0 protocol.PacketNumber) {
+// SetHandshakeConfirmed mocks base method
+func (m *MockCryptoSetup) SetHandshakeConfirmed() {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "SetLargest1RTTAcked", arg0)
+	m.ctrl.Call(m, "SetHandshakeConfirmed")
+}
+
+// SetHandshakeConfirmed indicates an expected call of SetHandshakeConfirmed
+func (mr *MockCryptoSetupMockRecorder) SetHandshakeConfirmed() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetHandshakeConfirmed", reflect.TypeOf((*MockCryptoSetup)(nil).SetHandshakeConfirmed))
+}
+
+// SetLargest1RTTAcked mocks base method
+func (m *MockCryptoSetup) SetLargest1RTTAcked(arg0 protocol.PacketNumber) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SetLargest1RTTAcked", arg0)
+	ret0, _ := ret[0].(error)
+	return ret0
 }
 
 // SetLargest1RTTAcked indicates an expected call of SetLargest1RTTAcked

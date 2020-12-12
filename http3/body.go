@@ -13,8 +13,6 @@ import (
 type body struct {
 	str quic.Stream
 
-	isRequest bool
-
 	// only set for the http.Response
 	// The channel is closed when the user is done with this response:
 	// either when Read() errors, or when Close() is called.
@@ -32,7 +30,6 @@ func newRequestBody(str quic.Stream, onFrameError func()) *body {
 	return &body{
 		str:          str,
 		onFrameError: onFrameError,
-		isRequest:    true,
 	}
 }
 
@@ -46,7 +43,7 @@ func newResponseBody(str quic.Stream, done chan<- struct{}, onFrameError func())
 
 func (r *body) Read(b []byte) (int, error) {
 	n, err := r.readImpl(b)
-	if err != nil && !r.isRequest {
+	if err != nil {
 		r.requestDone()
 	}
 	return n, err
@@ -88,19 +85,16 @@ func (r *body) readImpl(b []byte) (int, error) {
 }
 
 func (r *body) requestDone() {
-	r.reqDoneClosed.Do(func() {
-		close(r.reqDone)
-	})
+	if r.reqDoneClosed || r.reqDone == nil {
+		return
+	}
+	close(r.reqDone)
+	r.reqDoneClosed = true
 }
 
 func (r *body) Close() error {
-	// cancel Read to make sure server.go@268 will return io.EOF.
-	r.str.CancelRead(quic.ErrorCode(errorRequestCanceled))
-
-	// quic.Stream.Close() closes the write side, not the read side
-	if r.isRequest {
-		return r.str.Close()
-	}
 	r.requestDone()
+	// If the EOF was read, CancelRead() is a no-op.
+	r.str.CancelRead(quic.ErrorCode(errorRequestCanceled))
 	return nil
 }

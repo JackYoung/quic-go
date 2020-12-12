@@ -49,7 +49,7 @@ func (mr *MockSessionRunnerMockRecorder) Add(arg0, arg1 interface{}) *gomock.Cal
 }
 
 // AddResetToken mocks base method
-func (m *MockSessionRunner) AddResetToken(arg0 [16]byte, arg1 packetHandler) {
+func (m *MockSessionRunner) AddResetToken(arg0 protocol.StatelessResetToken, arg1 packetHandler) {
 	m.ctrl.T.Helper()
 	m.ctrl.Call(m, "AddResetToken", arg0, arg1)
 }
@@ -61,10 +61,10 @@ func (mr *MockSessionRunnerMockRecorder) AddResetToken(arg0, arg1 interface{}) *
 }
 
 // GetStatelessResetToken mocks base method
-func (m *MockSessionRunner) GetStatelessResetToken(arg0 protocol.ConnectionID) [16]byte {
+func (m *MockSessionRunner) GetStatelessResetToken(arg0 protocol.ConnectionID) protocol.StatelessResetToken {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetStatelessResetToken", arg0)
-	ret0, _ := ret[0].([16]byte)
+	ret0, _ := ret[0].(protocol.StatelessResetToken)
 	return ret0
 }
 
@@ -87,7 +87,7 @@ func (mr *MockSessionRunnerMockRecorder) Remove(arg0 interface{}) *gomock.Call {
 }
 
 // RemoveResetToken mocks base method
-func (m *MockSessionRunner) RemoveResetToken(arg0 [16]byte) {
+func (m *MockSessionRunner) RemoveResetToken(arg0 protocol.StatelessResetToken) {
 	m.ctrl.T.Helper()
 	m.ctrl.Call(m, "RemoveResetToken", arg0)
 }
@@ -120,16 +120,4 @@ func (m *MockSessionRunner) Retire(arg0 protocol.ConnectionID) {
 func (mr *MockSessionRunnerMockRecorder) Retire(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Retire", reflect.TypeOf((*MockSessionRunner)(nil).Retire), arg0)
-}
-
-// RetireResetToken mocks base method
-func (m *MockSessionRunner) RetireResetToken(arg0 [16]byte) {
-	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "RetireResetToken", arg0)
-}
-
-// RetireResetToken indicates an expected call of RetireResetToken
-func (mr *MockSessionRunnerMockRecorder) RetireResetToken(arg0 interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RetireResetToken", reflect.TypeOf((*MockSessionRunner)(nil).RetireResetToken), arg0)
 }

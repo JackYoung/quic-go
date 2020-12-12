@@ -11,7 +11,6 @@ import (
 
 	gomock "github.com/golang/mock/gomock"
 	protocol "github.com/lucas-clemente/quic-go/internal/protocol"
-	qtls "github.com/marten-seemann/qtls"
 )
 
 // MockQuicSession is a mock of QuicSession interface
@@ -82,10 +81,10 @@ func (mr *MockQuicSessionMockRecorder) CloseWithError(arg0, arg1 interface{}) *g
 }
 
 // ConnectionState mocks base method
-func (m *MockQuicSession) ConnectionState() qtls.ConnectionState {
+func (m *MockQuicSession) ConnectionState() ConnectionState {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ConnectionState")
-	ret0, _ := ret[0].(qtls.ConnectionState)
+	ret0, _ := ret[0].(ConnectionState)
 	return ret0
 }
 
@@ -223,20 +222,6 @@ func (m *MockQuicSession) RemoteAddr() net.Addr {
 func (mr *MockQuicSessionMockRecorder) RemoteAddr() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RemoteAddr", reflect.TypeOf((*MockQuicSession)(nil).RemoteAddr))
-}
-
-// closeForRecreating mocks base method
-func (m *MockQuicSession) closeForRecreating() protocol.PacketNumber {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "closeForRecreating")
-	ret0, _ := ret[0].(protocol.PacketNumber)
-	return ret0
-}
-
-// closeForRecreating indicates an expected call of closeForRecreating
-func (mr *MockQuicSessionMockRecorder) closeForRecreating() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "closeForRecreating", reflect.TypeOf((*MockQuicSession)(nil).closeForRecreating))
 }
 
 // destroy mocks base method

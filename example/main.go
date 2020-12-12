@@ -22,7 +22,8 @@ import (
 	"github.com/lucas-clemente/quic-go/http3"
 	"github.com/lucas-clemente/quic-go/internal/testdata"
 	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/quictrace"
+	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/lucas-clemente/quic-go/qlog"
 )
 
 type binds []string
@@ -52,45 +53,7 @@ func generatePRData(l int) []byte {
 	return res
 }
 
-var tracer quictrace.Tracer
-
-func init() {
-	tracer = quictrace.NewTracer()
-}
-
-func exportTraces() error {
-	traces := tracer.GetAllTraces()
-	if len(traces) != 1 {
-		return errors.New("expected exactly one trace")
-	}
-	for _, trace := range traces {
-		f, err := os.Create("trace.qtr")
-		if err != nil {
-			return err
-		}
-		if _, err := f.Write(trace); err != nil {
-			return err
-		}
-		f.Close()
-		fmt.Println("Wrote trace to", f.Name())
-	}
-	return nil
-}
-
-type tracingHandler struct {
-	handler http.Handler
-}
-
-var _ http.Handler = &tracingHandler{}
-
-func (h *tracingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.handler.ServeHTTP(w, r)
-	if err := exportTraces(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-func setupHandler(www string, trace bool) http.Handler {
+func setupHandler(www string) http.Handler {
 	mux := http.NewServeMux()
 
 	if len(www) > 0 {
@@ -168,10 +131,7 @@ func setupHandler(www string, trace bool) http.Handler {
 			</form></body></html>`)
 	})
 
-	if !trace {
-		return mux
-	}
-	return &tracingHandler{handler: mux}
+	return mux
 }
 
 func main() {
@@ -186,8 +146,7 @@ func main() {
 	flag.Var(&bs, "bind", "bind to")
 	www := flag.String("www", "", "www data")
 	tcp := flag.Bool("tcp", false, "also listen on TCP")
-	trace := flag.Bool("trace", false, "enable quic-trace")
-	qlog := flag.Bool("qlog", false, "output a qlog (in the same directory)")
+	enableQlog := flag.Bool("qlog", false, "output a qlog (in the same directory)")
 	flag.Parse()
 
 	logger := utils.DefaultLogger
@@ -203,13 +162,10 @@ func main() {
 		bs = binds{"localhost:6121"}
 	}
 
-	handler := setupHandler(*www, *trace)
+	handler := setupHandler(*www)
 	quicConf := &quic.Config{}
-	if *trace {
-		quicConf.QuicTracer = tracer
-	}
-	if *qlog {
-		quicConf.GetLogWriter = func(connID []byte) io.WriteCloser {
+	if *enableQlog {
+		quicConf.Tracer = qlog.NewTracer(func(_ logging.Perspective, connID []byte) io.WriteCloser {
 			filename := fmt.Sprintf("server_%x.qlog", connID)
 			f, err := os.Create(filename)
 			if err != nil {
@@ -217,7 +173,7 @@ func main() {
 			}
 			log.Printf("Creating qlog file %s.\n", filename)
 			return utils.NewBufferedWriteCloser(bufio.NewWriter(f), f)
-		}
+		})
 	}
 
 	var wg sync.WaitGroup
@@ -228,7 +184,7 @@ func main() {
 			var err error
 			if *tcp {
 				certFile, keyFile := testdata.GetCertificatePaths()
-				err = http3.ListenAndServe(bCap, certFile, keyFile, nil)
+				err = http3.ListenAndServe(bCap, certFile, keyFile, handler)
 			} else {
 				server := http3.Server{
 					Server:     &http.Server{Handler: handler, Addr: bCap},

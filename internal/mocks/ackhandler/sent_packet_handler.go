@@ -12,7 +12,6 @@ import (
 	ackhandler "github.com/lucas-clemente/quic-go/internal/ackhandler"
 	protocol "github.com/lucas-clemente/quic-go/internal/protocol"
 	wire "github.com/lucas-clemente/quic-go/internal/wire"
-	quictrace "github.com/lucas-clemente/quic-go/quictrace"
 )
 
 // MockSentPacketHandler is a mock of SentPacketHandler interface
@@ -64,18 +63,18 @@ func (mr *MockSentPacketHandlerMockRecorder) GetLossDetectionTimeout() *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetLossDetectionTimeout", reflect.TypeOf((*MockSentPacketHandler)(nil).GetLossDetectionTimeout))
 }
 
-// GetStats mocks base method
-func (m *MockSentPacketHandler) GetStats() *quictrace.TransportState {
+// HasPacingBudget mocks base method
+func (m *MockSentPacketHandler) HasPacingBudget() bool {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetStats")
-	ret0, _ := ret[0].(*quictrace.TransportState)
+	ret := m.ctrl.Call(m, "HasPacingBudget")
+	ret0, _ := ret[0].(bool)
 	return ret0
 }
 
-// GetStats indicates an expected call of GetStats
-func (mr *MockSentPacketHandlerMockRecorder) GetStats() *gomock.Call {
+// HasPacingBudget indicates an expected call of HasPacingBudget
+func (mr *MockSentPacketHandlerMockRecorder) HasPacingBudget() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetStats", reflect.TypeOf((*MockSentPacketHandler)(nil).GetStats))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasPacingBudget", reflect.TypeOf((*MockSentPacketHandler)(nil).HasPacingBudget))
 }
 
 // OnLossDetectionTimeout mocks base method
@@ -149,6 +148,18 @@ func (mr *MockSentPacketHandlerMockRecorder) ReceivedAck(arg0, arg1, arg2 interf
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReceivedAck", reflect.TypeOf((*MockSentPacketHandler)(nil).ReceivedAck), arg0, arg1, arg2)
 }
 
+// ReceivedBytes mocks base method
+func (m *MockSentPacketHandler) ReceivedBytes(arg0 protocol.ByteCount) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ReceivedBytes", arg0)
+}
+
+// ReceivedBytes indicates an expected call of ReceivedBytes
+func (mr *MockSentPacketHandlerMockRecorder) ReceivedBytes(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ReceivedBytes", reflect.TypeOf((*MockSentPacketHandler)(nil).ReceivedBytes), arg0)
+}
+
 // ResetForRetry mocks base method
 func (m *MockSentPacketHandler) ResetForRetry() error {
 	m.ctrl.T.Helper()
@@ -189,30 +200,16 @@ func (mr *MockSentPacketHandlerMockRecorder) SentPacket(arg0 interface{}) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SentPacket", reflect.TypeOf((*MockSentPacketHandler)(nil).SentPacket), arg0)
 }
 
-// SetHandshakeComplete mocks base method
-func (m *MockSentPacketHandler) SetHandshakeComplete() {
+// SetHandshakeConfirmed mocks base method
+func (m *MockSentPacketHandler) SetHandshakeConfirmed() {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "SetHandshakeComplete")
+	m.ctrl.Call(m, "SetHandshakeConfirmed")
 }
 
-// SetHandshakeComplete indicates an expected call of SetHandshakeComplete
-func (mr *MockSentPacketHandlerMockRecorder) SetHandshakeComplete() *gomock.Call {
+// SetHandshakeConfirmed indicates an expected call of SetHandshakeConfirmed
+func (mr *MockSentPacketHandlerMockRecorder) SetHandshakeConfirmed() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetHandshakeComplete", reflect.TypeOf((*MockSentPacketHandler)(nil).SetHandshakeComplete))
-}
-
-// ShouldSendNumPackets mocks base method
-func (m *MockSentPacketHandler) ShouldSendNumPackets() int {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ShouldSendNumPackets")
-	ret0, _ := ret[0].(int)
-	return ret0
-}
-
-// ShouldSendNumPackets indicates an expected call of ShouldSendNumPackets
-func (mr *MockSentPacketHandlerMockRecorder) ShouldSendNumPackets() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ShouldSendNumPackets", reflect.TypeOf((*MockSentPacketHandler)(nil).ShouldSendNumPackets))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetHandshakeConfirmed", reflect.TypeOf((*MockSentPacketHandler)(nil).SetHandshakeConfirmed))
 }
 
 // TimeUntilSend mocks base method

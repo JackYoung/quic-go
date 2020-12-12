@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/lucas-clemente/quic-go"
 	mockquic "github.com/lucas-clemente/quic-go/internal/mocks/quic"
+	"github.com/lucas-clemente/quic-go/internal/protocol"
 	"github.com/lucas-clemente/quic-go/internal/testdata"
 	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/marten-seemann/qpack"
@@ -21,6 +21,19 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
+
+type mockConn struct {
+	net.Conn
+	version protocol.VersionNumber
+}
+
+func newMockConn(version protocol.VersionNumber) net.Conn {
+	return &mockConn{version: version}
+}
+
+func (c *mockConn) GetQUICVersion() protocol.VersionNumber {
+	return c.version
+}
 
 var _ = Describe("Server", func() {
 	var (
@@ -122,6 +135,7 @@ var _ = Describe("Server", func() {
 			str.EXPECT().Write(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
 				return len(p), nil
 			}).AnyTimes()
+			str.EXPECT().CancelRead(gomock.Any())
 
 			Expect(s.handleRequest(sess, str, qpackDecoder, nil)).To(Equal(requestError{}))
 			var req *http.Request
@@ -140,6 +154,7 @@ var _ = Describe("Server", func() {
 			str.EXPECT().Write(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
 				return responseBuf.Write(p)
 			}).AnyTimes()
+			str.EXPECT().CancelRead(gomock.Any())
 
 			serr := s.handleRequest(sess, str, qpackDecoder, nil)
 			Expect(serr.err).ToNot(HaveOccurred())
@@ -198,7 +213,7 @@ var _ = Describe("Server", func() {
 				str.EXPECT().Write(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
 					return responseBuf.Write(p)
 				}).AnyTimes()
-				str.EXPECT().CancelRead(quic.ErrorCode(errorEarlyResponse))
+				str.EXPECT().CancelRead(quic.ErrorCode(errorNoError))
 				str.EXPECT().Close().Do(func() { close(done) })
 
 				s.handleConn(sess)
@@ -208,7 +223,7 @@ var _ = Describe("Server", func() {
 			})
 
 			It("errors when the client sends a too large header frame", func() {
-				s.Server.MaxHeaderBytes = 42
+				s.Server.MaxHeaderBytes = 20
 				s.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					Fail("Handler should not be called.")
 				})
@@ -272,7 +287,9 @@ var _ = Describe("Server", func() {
 					close(handlerCalled)
 				})
 
-				url := bytes.Repeat([]byte{'a'}, http.DefaultMaxHeaderBytes+1)
+				// use 2*DefaultMaxHeaderBytes here. qpack will compress the requiest,
+				// but the request will still end up larger than DefaultMaxHeaderBytes.
+				url := bytes.Repeat([]byte{'a'}, http.DefaultMaxHeaderBytes*2)
 				req, err := http.NewRequest(http.MethodGet, "https://"+string(url), nil)
 				Expect(err).ToNot(HaveOccurred())
 				setRequest(encodeRequest(req))
@@ -303,7 +320,7 @@ var _ = Describe("Server", func() {
 			str.EXPECT().Write(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
 				return len(p), nil
 			}).AnyTimes()
-			str.EXPECT().CancelRead(quic.ErrorCode(errorEarlyResponse))
+			str.EXPECT().CancelRead(quic.ErrorCode(errorNoError))
 
 			serr := s.handleRequest(sess, str, qpackDecoder, nil)
 			Expect(serr.err).ToNot(HaveOccurred())
@@ -326,7 +343,7 @@ var _ = Describe("Server", func() {
 			str.EXPECT().Write(gomock.Any()).DoAndReturn(func(p []byte) (int, error) {
 				return len(p), nil
 			}).AnyTimes()
-			str.EXPECT().CancelRead(quic.ErrorCode(errorEarlyResponse))
+			str.EXPECT().CancelRead(quic.ErrorCode(errorNoError))
 
 			serr := s.handleRequest(sess, str, qpackDecoder, nil)
 			Expect(serr.err).ToNot(HaveOccurred())
@@ -335,18 +352,13 @@ var _ = Describe("Server", func() {
 	})
 
 	Context("setting http headers", func() {
-		var expected http.Header
-
-		getExpectedHeader := func() http.Header {
-			return http.Header{
-				"Alt-Svc": {fmt.Sprintf(`%s=":443"; ma=2592000`, nextProtoH3)},
-			}
-		}
-
 		BeforeEach(func() {
-			Expect(getExpectedHeader()).To(Equal(http.Header{"Alt-Svc": {nextProtoH3 + `=":443"; ma=2592000`}}))
-			expected = getExpectedHeader()
+			s.QuicConfig = &quic.Config{Versions: []protocol.VersionNumber{protocol.VersionDraft29}}
 		})
+
+		expected := http.Header{
+			"Alt-Svc": {`h3-29=":443"; ma=2592000`},
+		}
 
 		It("sets proper headers with numeric port", func() {
 			s.Server.Addr = ":443"
@@ -377,6 +389,14 @@ var _ = Describe("Server", func() {
 			hdr = http.Header{}
 			Expect(s.SetQuicHeaders(hdr)).To(Succeed())
 			Expect(hdr).To(Equal(expected))
+		})
+
+		It("works if the quic.Config sets QUIC versions", func() {
+			s.Server.Addr = ":443"
+			s.QuicConfig.Versions = []quic.VersionNumber{quic.VersionDraft32, quic.VersionDraft29}
+			hdr := http.Header{}
+			Expect(s.SetQuicHeaders(hdr)).To(Succeed())
+			Expect(hdr).To(Equal(http.Header{"Alt-Svc": {`h3-32=":443"; ma=2592000,h3-29=":443"; ma=2592000`}}))
 		})
 	})
 
@@ -492,6 +512,15 @@ var _ = Describe("Server", func() {
 			Expect(s.Close()).To(Succeed())
 		})
 
+		checkGetConfigForClientVersions := func(conf *tls.Config) {
+			c, err := conf.GetConfigForClient(&tls.ClientHelloInfo{Conn: newMockConn(protocol.VersionDraft29)})
+			ExpectWithOffset(1, err).ToNot(HaveOccurred())
+			ExpectWithOffset(1, c.NextProtos).To(Equal([]string{nextProtoH3Draft29}))
+			c, err = conf.GetConfigForClient(&tls.ClientHelloInfo{Conn: newMockConn(protocol.VersionDraft32)})
+			ExpectWithOffset(1, err).ToNot(HaveOccurred())
+			ExpectWithOffset(1, c.NextProtos).To(Equal([]string{nextProtoH3Draft32}))
+		}
+
 		It("uses the quic.Config to start the QUIC server", func() {
 			conf := &quic.Config{HandshakeTimeout: time.Nanosecond}
 			var receivedConf *quic.Config
@@ -504,8 +533,11 @@ var _ = Describe("Server", func() {
 			Expect(receivedConf).To(Equal(conf))
 		})
 
-		It("replaces the ALPN token to the tls.Config", func() {
-			tlsConf := &tls.Config{NextProtos: []string{"foo", "bar"}}
+		It("sets the GetConfigForClient and replaces the ALPN token to the tls.Config, if the GetConfigForClient callback is not set", func() {
+			tlsConf := &tls.Config{
+				ClientAuth: tls.RequireAndVerifyClientCert,
+				NextProtos: []string{"foo", "bar"},
+			}
 			var receivedConf *tls.Config
 			quicListenAddr = func(addr string, tlsConf *tls.Config, _ *quic.Config) (quic.EarlyListener, error) {
 				receivedConf = tlsConf
@@ -513,25 +545,35 @@ var _ = Describe("Server", func() {
 			}
 			s.TLSConfig = tlsConf
 			Expect(s.ListenAndServe()).To(HaveOccurred())
-			Expect(receivedConf.NextProtos).To(Equal([]string{nextProtoH3}))
+			Expect(receivedConf.NextProtos).To(BeEmpty())
+			Expect(receivedConf.ClientAuth).To(BeZero())
 			// make sure the original tls.Config was not modified
 			Expect(tlsConf.NextProtos).To(Equal([]string{"foo", "bar"}))
+			// make sure that the config returned from the GetConfigForClient callback sets the fields of the original config
+			conf, err := receivedConf.GetConfigForClient(&tls.ClientHelloInfo{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(conf.ClientAuth).To(Equal(tls.RequireAndVerifyClientCert))
+			checkGetConfigForClientVersions(receivedConf)
 		})
 
-		It("uses the ALPN token if no tls.Config is given", func() {
+		It("sets the GetConfigForClient callback if no tls.Config is given", func() {
 			var receivedConf *tls.Config
 			quicListenAddr = func(addr string, tlsConf *tls.Config, _ *quic.Config) (quic.EarlyListener, error) {
 				receivedConf = tlsConf
 				return nil, errors.New("listen err")
 			}
 			Expect(s.ListenAndServe()).To(HaveOccurred())
-			Expect(receivedConf.NextProtos).To(Equal([]string{nextProtoH3}))
+			Expect(receivedConf).ToNot(BeNil())
+			checkGetConfigForClientVersions(receivedConf)
 		})
 
 		It("sets the ALPN for tls.Configs returned by the tls.GetConfigForClient", func() {
 			tlsConf := &tls.Config{
 				GetConfigForClient: func(ch *tls.ClientHelloInfo) (*tls.Config, error) {
-					return &tls.Config{NextProtos: []string{"foo", "bar"}}, nil
+					return &tls.Config{
+						ClientAuth: tls.RequireAndVerifyClientCert,
+						NextProtos: []string{"foo", "bar"},
+					}, nil
 				},
 			}
 
@@ -542,14 +584,15 @@ var _ = Describe("Server", func() {
 			}
 			s.TLSConfig = tlsConf
 			Expect(s.ListenAndServe()).To(HaveOccurred())
-			// check that the config used by QUIC uses the h3 ALPN
-			conf, err := receivedConf.GetConfigForClient(&tls.ClientHelloInfo{})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(conf.NextProtos).To(Equal([]string{nextProtoH3}))
 			// check that the original config was not modified
-			conf, err = tlsConf.GetConfigForClient(&tls.ClientHelloInfo{})
+			conf, err := tlsConf.GetConfigForClient(&tls.ClientHelloInfo{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(conf.NextProtos).To(Equal([]string{"foo", "bar"}))
+			// check that the config returned by the GetConfigForClient callback uses the returned config
+			conf, err = receivedConf.GetConfigForClient(&tls.ClientHelloInfo{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(conf.ClientAuth).To(Equal(tls.RequireAndVerifyClientCert))
+			checkGetConfigForClientVersions(receivedConf)
 		})
 
 		It("sets the ALPN for tls.Configs returned by the tls.GetConfigForClient, if it returns a static tls.Config", func() {
@@ -567,14 +610,27 @@ var _ = Describe("Server", func() {
 			}
 			s.TLSConfig = tlsConf
 			Expect(s.ListenAndServe()).To(HaveOccurred())
-			// check that the config used by QUIC uses the h3 ALPN
-			conf, err := receivedConf.GetConfigForClient(&tls.ClientHelloInfo{})
-			Expect(err).ToNot(HaveOccurred())
-			Expect(conf.NextProtos).To(Equal([]string{nextProtoH3}))
 			// check that the original config was not modified
-			conf, err = tlsConf.GetConfigForClient(&tls.ClientHelloInfo{})
+			conf, err := tlsConf.GetConfigForClient(&tls.ClientHelloInfo{})
 			Expect(err).ToNot(HaveOccurred())
 			Expect(conf.NextProtos).To(Equal([]string{"foo", "bar"}))
+			checkGetConfigForClientVersions(receivedConf)
+		})
+
+		It("works if GetConfigForClient returns a nil tls.Config", func() {
+			tlsConf := &tls.Config{GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) { return nil, nil }}
+
+			var receivedConf *tls.Config
+			quicListenAddr = func(addr string, conf *tls.Config, _ *quic.Config) (quic.EarlyListener, error) {
+				receivedConf = conf
+				return nil, errors.New("listen err")
+			}
+			s.TLSConfig = tlsConf
+			Expect(s.ListenAndServe()).To(HaveOccurred())
+			conf, err := receivedConf.GetConfigForClient(&tls.ClientHelloInfo{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(conf).ToNot(BeNil())
+			checkGetConfigForClientVersions(receivedConf)
 		})
 	})
 
